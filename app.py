@@ -2,7 +2,7 @@ import io, os, secrets
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, flash, session, abort, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
-from config import Config
+
 from db import get_db, init_app
 from logic import BusinessError, validate_event, can_register, certificate_allowed
 
