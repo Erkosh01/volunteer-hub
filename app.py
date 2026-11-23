@@ -1,232 +1,280 @@
-import io, os, secrets
+import os
+import sqlite3
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, flash, session, abort, send_file
+from datetime import datetime
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, g
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from db import get_db, init_app
-from logic import BusinessError, validate_event, can_register, certificate_allowed
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
+DB = os.environ.get("DATABASE_PATH", "volunteer_hub.db")
 
-def create_app(test_config=None):
-    app = Flask(__name__)
-    app.config.from_object(Config)
-    if test_config:
-        app.config.update(test_config)
-    init_app(app)
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB)
+        g.db.row_factory = sqlite3.Row
+    return g.db
 
-    @app.before_request
-    def csrf_guard():
-        if request.method == "POST":
-            token = session.get("_csrf")
-            submitted = request.form.get("_csrf")
-            if not token or not submitted or not secrets.compare_digest(token, submitted):
-                abort(400, "Қауіпсіздік токені жарамсыз. Бетті жаңартыңыз.")
+@app.teardown_appcontext
+def close_db(error=None):
+    conn = g.pop("db", None)
+    if conn:
+        conn.close()
 
-    @app.context_processor
-    def inject_globals():
-        if "_csrf" not in session:
-            session["_csrf"] = secrets.token_urlsafe(32)
-        return {"csrf_token": session["_csrf"], "current_user": session.get("user")}
+def init_db():
+    with sqlite3.connect(DB) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+          email TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
+          phone TEXT DEFAULT '', city TEXT DEFAULT 'Қызылорда',
+          is_admin INTEGER DEFAULT 0, created TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS organizations(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+          category TEXT NOT NULL, description TEXT DEFAULT '',
+          address TEXT DEFAULT '', contact TEXT DEFAULT '',
+          members INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+          description TEXT DEFAULT '', place TEXT DEFAULT '',
+          event_date TEXT DEFAULT '', capacity INTEGER DEFAULT 30,
+          created_by INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS event_members(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER,
+          user_id INTEGER, UNIQUE(event_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS animal_posts(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, animal TEXT NOT NULL,
+          kind TEXT NOT NULL, description TEXT DEFAULT '',
+          location TEXT DEFAULT '', contact TEXT NOT NULL,
+          author_id INTEGER, created TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS help_requests(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+          description TEXT DEFAULT '', contact TEXT NOT NULL,
+          author_id INTEGER, created TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS hours(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+          amount REAL NOT NULL, note TEXT DEFAULT ''
+        );
+        """)
+        admin_email = os.environ.get("ADMIN_EMAIL", "admin@volunteer.kz")
+        admin_pass = os.environ.get("ADMIN_PASSWORD", "ChangeMe123!")
+        exists = con.execute("SELECT id FROM users WHERE email=?", (admin_email,)).fetchone()
+        if not exists:
+            con.execute("INSERT INTO users(name,email,password,is_admin) VALUES(?,?,?,1)",
+                        ("Әкімші", admin_email, generate_password_hash(admin_pass)))
 
-    def login_required(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            if not session.get("user"):
-                flash("Алдымен жүйеге кіріңіз.", "warning")
-                return redirect(url_for("login"))
-            return fn(*args, **kwargs)
-        return wrapper
+init_db()
 
-    def admin_required(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            if not session.get("user") or session["user"]["role"] != "admin":
-                abort(403)
-            return fn(*args, **kwargs)
-        return wrapper
+def login_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not session.get("uid"):
+            flash("Алдымен жүйеге кіріңіз.")
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapped
 
-    @app.get("/")
-    def index():
-        db = get_db()
-        events = db.execute("""SELECT e.*,
-            (SELECT COUNT(*) FROM registrations r WHERE r.event_id=e.id) AS registered
-            FROM events e WHERE e.status != 'cancelled' ORDER BY e.event_date""").fetchall()
-        return render_template("index.html", events=events)
+def admin_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        user = db().execute("SELECT * FROM users WHERE id=?", (session.get("uid"),)).fetchone()
+        if not user or not user["is_admin"]:
+            flash("Бұл бөлім тек әкімшіге арналған.")
+            return redirect(url_for("home"))
+        return fn(*args, **kwargs)
+    return wrapped
 
-    @app.route("/register", methods=["GET", "POST"])
-    def register():
-        if request.method == "POST":
-            name = request.form.get("name","").strip()
-            email = request.form.get("email","").strip().lower()
-            password = request.form.get("password","")
-            if not name or len(name) > 80 or "@" not in email or len(password) < 8:
-                flash("Аты-жөнін, дұрыс email және кемінде 8 таңбалы құпиясөз енгізіңіз.", "danger")
-            else:
-                try:
-                    get_db().execute("INSERT INTO users(name,email,password_hash) VALUES(?,?,?)",
-                        (name,email,generate_password_hash(password)))
-                    get_db().commit()
-                    flash("Тіркелу сәтті аяқталды. Жүйеге кіріңіз.", "success")
-                    return redirect(url_for("login"))
-                except Exception:
-                    get_db().rollback()
-                    flash("Бұл email бұрын тіркелген болуы мүмкін.", "danger")
-        return render_template("register.html")
+BASE = """
+<!doctype html><html lang="kk"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} | Volunteer Hub</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182235;font:16px Arial}
+header{background:#102a43;color:white;padding:17px 5%;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+header a{color:white;text-decoration:none;margin:5px}.wrap{max-width:1050px;margin:25px auto;padding:0 15px}
+.hero,.card,form{background:white;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 5px 20px #102a4310}
+.hero{background:linear-gradient(120deg,#123b5d,#167d78);color:white;padding:30px}
+h1,h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+input,textarea,select{width:100%;padding:12px;margin:7px 0 14px;border:1px solid #ccd5df;border-radius:9px;font:inherit}
+button,.btn{display:inline-block;background:#087f75;color:white;border:0;border-radius:9px;padding:11px 16px;text-decoration:none;cursor:pointer}
+small,.muted{color:#66758a}.hero .muted{color:#e2f3f2}.danger{color:#b42318}
+.flash{background:#fff1cf;padding:12px;border-radius:9px;margin:10px 0}
+footer{text-align:center;color:#718096;padding:25px}
+</style>
+<header><b>🌱 Volunteer Hub</b><nav>
+<a href="/">Басты бет</a><a href="/organizations">Ұйымдар</a><a href="/events">Іс-шаралар</a>
+<a href="/animals">Жануарларға көмек</a><a href="/help">Көмек сұрау</a>
+{% if user %}<a href="/profile">Профиль</a><a href="/logout">Шығу</a>{% else %}<a href="/login">Кіру</a><a href="/register">Тіркелу</a>{% endif %}
+{% if user and user.is_admin %}<a href="/admin">Әкімші</a>{% endif %}
+</nav></header><main class="wrap">
+{% with messages=get_flashed_messages() %}{% for m in messages %}<div class="flash">{{m}}</div>{% endfor %}{% endwith %}
+{{ content|safe }}</main><footer>Volunteer Hub · Қызылорда волонтерлер порталы</footer></html>
+"""
 
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if request.method == "POST":
-            email = request.form.get("email","").strip().lower()
-            user = get_db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-            if user and check_password_hash(user["password_hash"], request.form.get("password","")):
-                session.clear()
-                session["user"] = {"id": user["id"], "name": user["name"], "role": user["role"]}
-                session["_csrf"] = secrets.token_urlsafe(32)
-                return redirect(url_for("index"))
-            flash("Email немесе құпиясөз қате.", "danger")
-        return render_template("login.html")
+def page(title, body, **kwargs):
+    user = db().execute("SELECT * FROM users WHERE id=?", (session.get("uid"),)).fetchone() if session.get("uid") else None
+    inner = render_template_string(body, user=user, **kwargs)
+    return render_template_string(BASE, title=title, content=inner, user=user)
 
-    @app.post("/logout")
-    @login_required
-    def logout():
-        session.clear()
-        return redirect(url_for("index"))
+@app.route("/")
+def home():
+    con=db()
+    stats={
+      "users":con.execute("SELECT COUNT(*) FROM users WHERE is_admin=0").fetchone()[0],
+      "orgs":con.execute("SELECT COUNT(*) FROM organizations").fetchone()[0],
+      "events":con.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+      "animals":con.execute("SELECT COUNT(*) FROM animal_posts").fetchone()[0]}
+    return page("Басты бет", """
+    <section class="hero"><h1>Жақсылық жасауды бірге бастайық!</h1>
+    <p class="muted">Қызылордадағы волонтерлерді, ұйымдарды және пайдалы бастамаларды біріктіретін платформа.</p>
+    <a class="btn" href="/events">Іс-шараларды көру</a></section>
+    <div class="grid">{% for k,v in stats.items() %}<div class="card"><h2>{{v}}</h2><span class="muted">{{ {'users':'Ерікті','orgs':'Ұйым','events':'Іс-шара','animals':'Жануарларға көмек жазбасы'}[k] }}</span></div>{% endfor %}</div>
+    <div class="grid"><div class="card"><h2>🤝 Волонтерлік</h2><p>Қоғамдық шараларға қатысып, тәжірибе жинаңыз.</p></div>
+    <div class="card"><h2>🐾 Жануарларды қорғау</h2><p>Жануарларға көмек, асырап алу және жоғалған жануар туралы хабарландыру.</p></div>
+    <div class="card"><h2>📣 Көмек сұрау</h2><p>Қажетті көмек туралы хабарлама жариялаңыз.</p></div></div>
+    """, stats=stats)
 
-    @app.get("/events/<int:event_id>")
-    def event_detail(event_id):
-        db = get_db()
-        event = db.execute("""SELECT e.*,(SELECT COUNT(*) FROM registrations r
-            WHERE r.event_id=e.id) registered FROM events e WHERE e.id=?""",(event_id,)).fetchone()
-        if not event: abort(404)
-        joined = False
-        if session.get("user"):
-            joined = db.execute("SELECT 1 FROM registrations WHERE user_id=? AND event_id=?",
-                (session["user"]["id"],event_id)).fetchone() is not None
-        return render_template("event.html", event=event, joined=joined)
-
-    @app.post("/events/<int:event_id>/join")
-    @login_required
-    def join_event(event_id):
-        db=get_db()
-        db.execute("BEGIN IMMEDIATE")
-        event=db.execute("SELECT * FROM events WHERE id=?",(event_id,)).fetchone()
-        if not event:
-            db.rollback(); abort(404)
-        count=db.execute("SELECT COUNT(*) FROM registrations WHERE event_id=?",(event_id,)).fetchone()[0]
-        if event["status"] != "open" or not can_register(event["capacity"],count):
-            db.rollback(); flash("Орын жоқ немесе тіркелу жабық.","warning")
-        else:
-            try:
-                db.execute("INSERT INTO registrations(user_id,event_id) VALUES(?,?)",
-                    (session["user"]["id"],event_id))
-                db.commit(); flash("Іс-шараға сәтті тіркелдіңіз!","success")
-            except Exception:
-                db.rollback(); flash("Сіз бұл іс-шараға бұрын тіркелгенсіз.","warning")
-        return redirect(url_for("event_detail",event_id=event_id))
-
-    @app.get("/my")
-    @login_required
-    def my_events():
-        rows=get_db().execute("""SELECT e.*,r.attended,r.id registration_id
-            FROM registrations r JOIN events e ON e.id=r.event_id
-            WHERE r.user_id=? ORDER BY e.event_date""",(session["user"]["id"],)).fetchall()
-        return render_template("my.html", rows=rows)
-
-    @app.get("/admin")
-    @admin_required
-    def admin():
-        db=get_db()
-        events=db.execute("""SELECT e.*,(SELECT COUNT(*) FROM registrations r WHERE r.event_id=e.id) registered
-            FROM events e ORDER BY e.event_date""").fetchall()
-        stats=db.execute("""SELECT COUNT(*) users,
-            (SELECT COUNT(*) FROM events) events,
-            (SELECT COUNT(*) FROM registrations) registrations FROM users""").fetchone()
-        # Matplotlib chart is generated locally from aggregate DB values.
+@app.route("/register", methods=["GET","POST"])
+def register():
+    if request.method=="POST":
+        name=request.form["name"].strip(); email=request.form["email"].strip().lower()
+        password=request.form["password"]
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            labels=["Пайдаланушылар","Іс-шаралар","Тіркелулер"]
-            values=[stats["users"],stats["events"],stats["registrations"]]
-            fig,ax=plt.subplots(figsize=(6,3.2)); ax.bar(labels,values)
-            ax.set_title("Портал статистикасы"); ax.set_ylabel("Саны")
-            fig.tight_layout()
-            os.makedirs(app.static_folder,exist_ok=True)
-            fig.savefig(os.path.join(app.static_folder,"stats.png"),dpi=120)
-            plt.close(fig)
-        except Exception:
-            pass
-        return render_template("admin.html",events=events,stats=stats)
+            db().execute("INSERT INTO users(name,email,password,phone) VALUES(?,?,?,?)",
+                         (name,email,generate_password_hash(password),request.form.get("phone","")))
+            db().commit(); flash("Тіркелу сәтті аяқталды. Енді жүйеге кіріңіз.")
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            flash("Бұл email бұрын тіркелген.")
+    return page("Тіркелу", """<form method="post"><h2>Тіркелу</h2>
+    Аты-жөні<input name="name" required> Email<input type="email" name="email" required>
+    Телефон<input name="phone"> Құпиясөз<input type="password" name="password" minlength="6" required>
+    <button>Тіркелу</button></form>""")
 
-    @app.route("/admin/events/new", methods=["GET","POST"])
-    @admin_required
-    def new_event():
-        if request.method=="POST":
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST":
+        u=db().execute("SELECT * FROM users WHERE email=?", (request.form["email"].lower(),)).fetchone()
+        if u and check_password_hash(u["password"],request.form["password"]):
+            session["uid"]=u["id"]; return redirect(url_for("home"))
+        flash("Email немесе құпиясөз қате.")
+    return page("Кіру", """<form method="post"><h2>Жүйеге кіру</h2>
+    Email<input type="email" name="email" required> Құпиясөз<input type="password" name="password" required>
+    <button>Кіру</button></form>""")
+
+@app.route("/logout")
+def logout():
+    session.clear(); return redirect(url_for("home"))
+
+@app.route("/organizations")
+def organizations():
+    rows=db().execute("SELECT * FROM organizations ORDER BY name").fetchall()
+    return page("Ұйымдар", """<h1>Волонтерлік ұйымдар мен топтар</h1><p class="muted">Мүшелер саны әкімші енгізген дерек бойынша көрсетіледі.</p>
+    {% for x in rows %}<div class="card"><h2>{{x.name}}</h2><b>{{x.category}}</b><p>{{x.description}}</p>
+    <p>📍 {{x.address}} · 👥 {{x.members}} мүше</p><p>Байланыс: {{x.contact}}</p></div>{% else %}<div class="card">Әзірге ұйымдар қосылмаған.</div>{% endfor %}""", rows=rows)
+
+@app.route("/events", methods=["GET","POST"])
+def events():
+    if request.method=="POST":
+        if not session.get("uid"): return redirect(url_for("login"))
+        db().execute("INSERT INTO events(title,description,place,event_date,capacity,created_by) VALUES(?,?,?,?,?,?)",
+          (request.form["title"],request.form.get("description",""),request.form.get("place",""),
+           request.form.get("event_date",""),max(1,int(request.form.get("capacity",30))),session["uid"]))
+        db().commit(); return redirect(url_for("events"))
+    rows=db().execute("""SELECT e.*, (SELECT COUNT(*) FROM event_members m WHERE m.event_id=e.id) joined
+                         FROM events e ORDER BY e.event_date""").fetchall()
+    return page("Іс-шаралар", """<h1>Волонтерлік іс-шаралар</h1>
+    {% if user %}<form method="post"><h2>Жаңа іс-шара қосу</h2>Атауы<input name="title" required>
+    Сипаттамасы<textarea name="description"></textarea>Өтетін орны<input name="place">
+    Күні<input type="date" name="event_date">Қатысушы шегі<input type="number" name="capacity" value="30" min="1">
+    <button>Жариялау</button></form>{% endif %}
+    {% for e in rows %}<div class="card"><h2>{{e.title}}</h2><p>{{e.description}}</p>
+    <p>📍 {{e.place}} · 📅 {{e.event_date}} · 👥 {{e.joined}}/{{e.capacity}}</p>
+    {% if user and e.joined < e.capacity %}<a class="btn" href="/join/{{e.id}}">Қатысу</a>{% elif e.joined >= e.capacity %}<b>Орын жоқ</b>{% endif %}</div>
+    {% else %}<div class="card">Іс-шара әзірге жоқ.</div>{% endfor %}""", rows=rows)
+
+@app.route("/join/<int:event_id>")
+@login_required
+def join(event_id):
+    e=db().execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+    if e:
+        count=db().execute("SELECT COUNT(*) FROM event_members WHERE event_id=?", (event_id,)).fetchone()[0]
+        if count < e["capacity"]:
             try:
-                data=validate_event(request.form.get("title"),request.form.get("description"),
-                    request.form.get("capacity"),request.form.get("event_date"))
-                get_db().execute("""INSERT INTO events(title,description,capacity,event_date,location,created_by)
-                    VALUES(?,?,?,?,?,?)""",(data["title"],data["description"],data["capacity"],
-                    data["event_date"],request.form.get("location","").strip(),session["user"]["id"]))
-                get_db().commit(); flash("Іс-шара қосылды.","success"); return redirect(url_for("admin"))
-            except BusinessError as exc: flash(str(exc),"danger")
-        return render_template("new_event.html")
+                db().execute("INSERT INTO event_members(event_id,user_id) VALUES(?,?)",(event_id,session["uid"]))
+                db().commit(); flash("Іс-шараға тіркелдіңіз.")
+            except sqlite3.IntegrityError: flash("Сіз бұл іс-шараға тіркелгенсіз.")
+        else: flash("Қатысушы саны толды.")
+    return redirect(url_for("events"))
 
-    @app.post("/admin/events/<int:event_id>/complete")
-    @admin_required
-    def complete_event(event_id):
-        db=get_db()
-        db.execute("UPDATE events SET status='completed' WHERE id=?",(event_id,))
-        db.commit()
-        flash("Іс-шара аяқталды. Енді қатысқан еріктілер сертификат ала алады.","success")
-        return redirect(url_for("admin"))
+@app.route("/animals", methods=["GET","POST"])
+def animals():
+    if request.method=="POST":
+        if not session.get("uid"): return redirect(url_for("login"))
+        db().execute("INSERT INTO animal_posts(animal,kind,description,location,contact,author_id) VALUES(?,?,?,?,?,?)",
+          (request.form["animal"],request.form["kind"],request.form.get("description",""),
+           request.form.get("location",""),request.form["contact"],session["uid"]))
+        db().commit(); return redirect(url_for("animals"))
+    rows=db().execute("SELECT * FROM animal_posts ORDER BY id DESC").fetchall()
+    return page("Жануарларға көмек", """<h1>🐾 Жануарларды қорғау бөлімі</h1>
+    {% if user %}<form method="post"><h2>Хабарландыру жариялау</h2>Жануар түрі<input name="animal" placeholder="Ит, мысық..." required>
+    Хабарландыру түрі<select name="kind"><option>Көмек қажет</option><option>Асырап алу</option><option>Жоғалған жануар</option><option>Табылған жануар</option><option>Еріктілер іздейміз</option></select>
+    Сипаттамасы<textarea name="description"></textarea>Орналасқан жері<input name="location">
+    Байланыс телефоны<input name="contact" required><button>Жариялау</button></form>{% endif %}
+    {% for x in rows %}<div class="card"><h2>{{x.animal}} · {{x.kind}}</h2><p>{{x.description}}</p><p>📍 {{x.location}} · ☎ {{x.contact}}</p></div>
+    {% else %}<div class="card">Хабарландыру жоқ.</div>{% endfor %}""", rows=rows)
 
-    @app.post("/admin/registrations/<int:registration_id>/attendance")
-    @admin_required
-    def attendance(registration_id):
-        db=get_db()
-        db.execute("UPDATE registrations SET attended=1 WHERE id=?",(registration_id,))
-        db.commit()
-        flash("Қатысу белгіленді.","success")
-        return redirect(url_for("admin"))
+@app.route("/help", methods=["GET","POST"])
+def help_board():
+    if request.method=="POST":
+        if not session.get("uid"): return redirect(url_for("login"))
+        db().execute("INSERT INTO help_requests(title,description,contact,author_id) VALUES(?,?,?,?)",
+          (request.form["title"],request.form.get("description",""),request.form["contact"],session["uid"]))
+        db().commit(); return redirect(url_for("help_board"))
+    rows=db().execute("SELECT * FROM help_requests ORDER BY id DESC").fetchall()
+    return page("Көмек сұрау", """<h1>Көмек сұрау тақтасы</h1>
+    {% if user %}<form method="post">Тақырып<input name="title" required>Толық ақпарат<textarea name="description"></textarea>
+    Байланыс<input name="contact" required><button>Жариялау</button></form>{% endif %}
+    {% for x in rows %}<div class="card"><h2>{{x.title}}</h2><p>{{x.description}}</p><p>Байланыс: {{x.contact}}</p></div>{% else %}<div class="card">Сұраныс жоқ.</div>{% endfor %}""", rows=rows)
 
-    @app.get("/certificate/<int:event_id>")
-    @login_required
-    def certificate(event_id):
-        row=get_db().execute("""SELECT u.name,e.title,e.event_date,e.status,r.attended
-            FROM registrations r JOIN users u ON u.id=r.user_id JOIN events e ON e.id=r.event_id
-            WHERE r.user_id=? AND r.event_id=?""",(session["user"]["id"],event_id)).fetchone()
-        if not row: abort(404)
-        if not certificate_allowed(row["status"],row["attended"]):
-            flash("Сертификат іс-шара аяқталып, қатысу расталғаннан кейін беріледі.","warning")
-            return redirect(url_for("my_events"))
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.lib import colors
-        buffer=io.BytesIO()
-        pdf=canvas.Canvas(buffer,pagesize=landscape(A4))
-        w,h=landscape(A4)
-        pdf.setStrokeColor(colors.HexColor("#1d6b59")); pdf.setLineWidth(4); pdf.rect(25,25,w-50,h-50)
-        # Helvetica is used for portability; Latin transliteration keeps PDF text reliable.
-        pdf.setFont("Helvetica-Bold",28); pdf.drawCentredString(w/2,h-145,"CERTIFICATE")
-        pdf.setFont("Helvetica",16); pdf.drawCentredString(w/2,h-195,"This certificate is awarded to")
-        pdf.setFont("Helvetica-Bold",24); pdf.drawCentredString(w/2,h-245,row["name"])
-        pdf.setFont("Helvetica",14); pdf.drawCentredString(w/2,h-290,"for participating in the volunteer event:")
-        pdf.setFont("Helvetica-Bold",18); pdf.drawCentredString(w/2,h-325,row["title"][:70])
-        pdf.setFont("Helvetica",12); pdf.drawCentredString(w/2,90,f"Event date: {row['event_date']}  |  Volunteer Hub")
-        pdf.save(); buffer.seek(0)
-        return send_file(buffer,mimetype="application/pdf",as_attachment=True,
-            download_name=f"certificate_{event_id}.pdf")
+@app.route("/profile", methods=["GET","POST"])
+@login_required
+def profile():
+    if request.method=="POST":
+        db().execute("INSERT INTO hours(user_id,amount,note) VALUES(?,?,?)",
+                     (session["uid"],float(request.form["amount"]),request.form.get("note","")))
+        db().commit()
+    u=db().execute("SELECT * FROM users WHERE id=?", (session["uid"],)).fetchone()
+    total=db().execute("SELECT COALESCE(SUM(amount),0) FROM hours WHERE user_id=?", (session["uid"],)).fetchone()[0]
+    joined=db().execute("SELECT COUNT(*) FROM event_members WHERE user_id=?", (session["uid"],)).fetchone()[0]
+    return page("Профиль", """<div class="card"><h1>{{u.name}}</h1><p>{{u.email}} · {{u.phone}}</p>
+    <h2>{{total}} волонтерлік сағат</h2><p>{{joined}} іс-шараға тіркелгенсіз.</p></div>
+    <form method="post"><h2>Волонтерлік сағат қосу</h2>Сағат саны<input type="number" name="amount" min="0.5" step="0.5" required>
+    Атқарылған жұмыс<input name="note"><button>Сақтау</button></form>""", u=u,total=total,joined=joined)
 
-    @app.errorhandler(403)
-    def forbidden(_): return render_template("error.html",code=403,message="Бұл бөлімге рұқсатыңыз жоқ."),403
-    @app.errorhandler(404)
-    def not_found(_): return render_template("error.html",code=404,message="Бет немесе жазба табылмады."),404
-    @app.errorhandler(400)
-    def bad_request(_): return render_template("error.html",code=400,message="Сұраныс жарамсыз. Бетті жаңартып көріңіз."),400
-    return app
+@app.route("/admin", methods=["GET","POST"])
+@admin_required
+def admin():
+    if request.method=="POST":
+        db().execute("""INSERT INTO organizations(name,category,description,address,contact,members)
+        VALUES(?,?,?,?,?,?)""",(request.form["name"],request.form["category"],request.form.get("description",""),
+        request.form.get("address",""),request.form.get("contact",""),int(request.form.get("members",0))))
+        db().commit(); flash("Ұйым қосылды.")
+    orgs=db().execute("SELECT * FROM organizations ORDER BY id DESC").fetchall()
+    return page("Әкімші", """<h1>Әкімші панелі</h1><form method="post"><h2>Ұйым/волонтерлік топ қосу</h2>
+    Атауы<input name="name" required>Бағыты<select name="category"><option>Қоғамдық волонтерлік</option>
+    <option>Жануарларды қорғау</option><option>Экологиялық</option><option>Медициналық</option>
+    <option>Әлеуметтік көмек</option><option>Жастар ұйымы</option><option>Басқа</option></select>
+    Сипаттамасы<textarea name="description"></textarea>Мекенжайы<input name="address">
+    Байланыс<input name="contact">Мүшелер саны<input type="number" name="members" min="0" value="0">
+    <button>Ұйымды сақтау</button></form><h2>Қосылған ұйымдар</h2>
+    {% for x in orgs %}<div class="card">{{x.name}} — {{x.category}} — {{x.members}} мүше</div>{% else %}<p>Әзірге ұйым жоқ.</p>{% endfor %}""", orgs=orgs)
 
-app=create_app()
-if __name__=="__main__":
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
